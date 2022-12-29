@@ -8,7 +8,14 @@ from concurrent.futures import Future
 import sys
 import threading
 import traceback
+import requests
+import os
+import time
+import json
+import boto3
 from uuid import uuid4
+from urllib.parse import urlparse
+from hashlib import sha256
 
 # - Overview -
 # This sample uses the AWS IoT Device Shadow Service to keep a property in
@@ -42,6 +49,7 @@ cmdUtils.register_command("client_id", "<str>", "Client ID to use for MQTT conne
 cmdUtils.register_command("thing_name", "<str>", "The name assigned to your IoT Thing", required=True)
 cmdUtils.register_command("shadow_property", "<str>", "The name of the shadow property you want to change (optional, default='color'", default="color")
 cmdUtils.register_command("is_ci", "<str>", "If present the sample will run in CI mode (optional, default='None'. Will publish shadow automatically if set)")
+cmdUtils.register_command("credential_endpoint", "<str>", "iot:CredentialProvider endpoint", True, str)
 # Needs to be called so the command utils parse the commands
 cmdUtils.get_args()
 
@@ -52,7 +60,7 @@ shadow_thing_name = cmdUtils.get_command_required("thing_name")
 shadow_property = cmdUtils.get_command("shadow_property")
 is_ci = cmdUtils.get_command("is_ci", None) != None
 
-SHADOW_VALUE_DEFAULT = "off"
+SHADOW_VALUE_DEFAULT = {}
 
 class LockedData:
     def __init__(self):
@@ -60,8 +68,72 @@ class LockedData:
         self.shadow_value = None
         self.disconnect_called = False
         self.request_tokens = set()
+        self.shadow_desired = {}
 
 locked_data = LockedData()
+
+class Credential:
+    def __init__(self):
+        self.cert = cmdUtils.get_command('cert')
+        self.key = cmdUtils.get_command('key')
+        self.ca_file = cmdUtils.get_command('ca_file')
+        self.credential_endpoint = cmdUtils.get_command('credential_endpoint')
+        self.headers = {"x-amzn-iot-thingname": cmdUtils.get_command_required("thing_name")}
+
+    def get(self):
+        response = requests.get(
+            f"https://{self.credential_endpoint}",
+            verify=self.ca_file,
+            cert=(self.cert, self.key),
+            headers=self.headers,
+        )
+        response.raise_for_status()
+        return json.loads(response.text)
+
+def hash_sha256(path):
+    m = sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if len(chunk) == 0:
+                break
+            m.update(chunk)
+        return m.hexdigest()
+
+def download_file(url, dst):
+    parsed = urlparse(url)
+    if parsed.scheme != "s3":
+        print(f"{url=} is not s3")
+        return
+
+    credential = Credential()
+    cred = credential.get()["credentials"]
+
+    s3_client = boto3.client(
+        "s3",
+        aws_access_key_id=cred["accessKeyId"],
+        aws_secret_access_key=cred["secretAccessKey"],
+        aws_session_token=cred["sessionToken"],
+    )
+    s3_client.download_file(parsed.netloc, parsed.path.lstrip("/"), dst)
+
+def download_file_with_delta(value):
+    with locked_data.lock:
+        url = value.get("url")
+        expected_hash = value.get("hash")
+        tmpfile = "/tmp/tmpfile"
+        print(f"  {url=}, {expected_hash=}")
+        if url is None:
+            url = locked_data.shadow_desired.get("url")
+        if url and expected_hash:
+            locked_data.shadow_desired["url"] = url
+            download_file(url, tmpfile)
+            actual_hash = hash_sha256(tmpfile)
+            if expected_hash == actual_hash:
+                return True
+            print("  invalid hash value {expected_hash} != {actual_hash}")
+        return False
+
 
 # Function for gracefully quitting this sample
 def exit(msg_or_exception):
@@ -103,11 +175,16 @@ def on_get_shadow_accepted(response):
                 return
 
         if response.state:
+            if response.state.desired:
+                locked_data.shadow_desired = response.state.desired.get(shadow_property)
+                print(f"  Save desired[{shadow_property}]: {locked_data.shadow_desired}")
+
             if response.state.delta:
                 value = response.state.delta.get(shadow_property)
                 if value:
                     print("  Shadow contains delta value '{}'.".format(value))
-                    change_shadow_value(value)
+                    if download_file_with_delta(value):
+                        change_shadow_value(value)
                     return
 
             if response.state.reported:
@@ -159,7 +236,8 @@ def on_shadow_delta_updated(delta):
                 print("  Delta reports that desired value is '{}'. Changing local value...".format(value))
                 if (delta.client_token is not None):
                     print ("  ClientToken is: " + delta.client_token)
-                change_shadow_value(value)
+                if download_file_with_delta(value):
+                    change_shadow_value(value)
         else:
             print("  Delta did not report a change in '{}'".format(shadow_property))
 
@@ -194,7 +272,6 @@ def on_update_shadow_accepted(response):
                     print ("Could not find shadow property with name: '{}'.".format(shadow_property)) # type: ignore
             else:
                 print("Shadow states cleared.") # when the shadow states are cleared, reported and desired are set to None
-            print("Enter desired value: ") # remind user they can input new values
         except:
             exit("Updated shadow is missing the target property")
 
@@ -387,13 +464,6 @@ if __name__ == '__main__':
 
         # Ensure that publish succeeds
         publish_get_future.result()
-
-        # Launch thread to handle user input.
-        # A "daemon" thread won't prevent the program from shutting down.
-        print("Launching thread to read user input...")
-        user_input_thread = threading.Thread(target=user_input_thread_fn, name='user_input_thread')
-        user_input_thread.daemon = True
-        user_input_thread.start()
 
     except Exception as e:
         exit(e)
